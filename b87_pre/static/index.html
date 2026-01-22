@@ -1,0 +1,293 @@
+<!-- static/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zodiac Calculator</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; }
+        .container { background-color: #f5f5f5; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1); margin-bottom: 20px; }
+        input, button, textarea { padding: 10px; margin: 5px; font-size: 14px; }
+        .result { margin-top: 15px; padding: 15px; background-color: white; border-radius: 5px; min-height: 50px; }
+        .error { color: red; }
+        .success { color: green; }
+        .hidden { display: none; }
+        .tab { display: inline-block; padding: 10px 20px; margin: 5px; background: #ddd; cursor: pointer; border-radius: 5px; }
+        .tab.active { background: #007bff; color: white; }
+        .history-item { border: 1px solid #ddd; margin: 5px 0; padding: 10px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <!-- Login Section -->
+    <div class="container" id="loginSection">
+        <h2>Login / Register</h2>
+        <input type="text" id="username" placeholder="Username">
+        <input type="password" id="password" placeholder="Password">
+        <button onclick="login()">Login</button>
+        <button onclick="register()">Register</button>
+        <div id="authMessage"></div>
+    </div>
+
+    <!-- Main App Section -->
+    <div class="container hidden" id="mainSection">
+        <h1>Zodiac Calculator</h1>
+        <div id="userInfo"></div>
+        <button onclick="logout()">Logout</button>
+        
+        <!-- Tabs -->
+        <div>
+            <span class="tab active" onclick="showTab('single')">Single Date</span>
+            <span class="tab" onclick="showTab('bulk')">Bulk Search</span>
+            <span class="tab" onclick="showTab('range')">Date Range</span>
+            <span class="tab" onclick="showTab('share')">Share Result</span>
+            <span class="tab" onclick="showTab('shared')">Shared Result</span>
+            <span class="tab" onclick="showTab('history')">History</span>
+        </div>
+
+        <!-- Single Date Tab -->
+        <div id="singleTab">
+            <p>Enter a date in DD-MM-YYYY format:</p>
+            <input type="text" id="dateInput" placeholder="DD-MM-YYYY">
+            <button onclick="calculateSingle()">Calculate</button>
+            <div class="result" id="singleResult"></div>
+        </div>
+
+        <!-- Bulk Search Tab -->
+        <div id="bulkTab" class="hidden">
+            <p>Enter dates (one per line) in DD-MM-YYYY format:</p>
+            <textarea id="bulkDates" rows="5" cols="50" placeholder="01-01-2000&#10;15-06-1995&#10;..."></textarea><br>
+            <button onclick="calculateBulk()">Calculate Bulk</button>
+            <div class="result" id="bulkResult"></div>
+        </div>
+
+        <!-- Date Range Tab -->
+        <div id="rangeTab" class="hidden">
+            <p>Enter date range:</p>
+            <input type="text" id="startDate" placeholder="Start: DD-MM-YYYY">
+            <input type="text" id="endDate" placeholder="End: DD-MM-YYYY">
+            <button onclick="calculateRange()">Calculate Range</button>
+            <div class="result" id="rangeResult"></div>
+        </div>
+
+        <!-- Share Tab -->
+        <div id="shareTab" class="hidden">
+            <p>Share a zodiac result:</p>
+            <input type="text" id="shareDateInput" placeholder="DD-MM-YYYY">
+            <button onclick="shareResult()">Create Share Link</button>
+            <div class="result" id="shareResult"></div>
+        </div>
+
+        <!-- Shared Tab -->
+        <div id="sharedTab" class="hidden">
+            <p>Shared result:</p>
+            <input type="text" id="sharedDateInput" placeholder="abc123">
+            <button onclick="loadShared()">Load Shared</button>
+            <div class="result" id="sharedResult"></div>
+        </div>
+
+        <!-- History Tab -->
+        <div id="historyTab" class="hidden">
+            <button onclick="loadHistory()">Refresh History</button>
+            <div class="result" id="historyResult"></div>
+        </div>
+    </div>
+
+    <script>
+        let sessionId = localStorage.getItem('sessionId');
+        let currentUser = localStorage.getItem('currentUser');
+
+        if (sessionId && currentUser) {
+            showMainSection();
+        }
+
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('[id$="Tab"]').forEach(t => t.classList.add('hidden'));
+            event.target.classList.add('active');
+            document.getElementById(tabName + 'Tab').classList.remove('hidden');
+        }
+
+        function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            fetch('/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username, password})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    sessionId = data.session_id;
+                    currentUser = data.username;
+                    localStorage.setItem('sessionId', sessionId);
+                    localStorage.setItem('currentUser', currentUser);
+                    showMainSection();
+                } else {
+                    document.getElementById('authMessage').innerHTML = '<span class="error">' + (data.error || 'Login failed') + '</span>';
+                }
+            });
+        }
+
+        function register() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+
+            if (username === '' || password === '') {
+                document.getElementById('authMessage').innerHTML = '<span class="error">Username and password are required</span>';
+                return;
+            }
+            
+            fetch('/register', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username, password})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('authMessage').innerHTML = '<span class="success">Registration successful! Please login.</span>';
+                } else {
+                    document.getElementById('authMessage').innerHTML = '<span class="error">' + (data.error || 'Registration failed') + '</span>';
+                }
+            });
+        }
+
+        function logout() {
+            sessionId = null;
+            currentUser = null;
+            localStorage.removeItem('sessionId');
+            localStorage.removeItem('currentUser');
+            document.getElementById('loginSection').classList.remove('hidden');
+            document.getElementById('mainSection').classList.add('hidden');
+        }
+
+        function showMainSection() {
+            document.getElementById('loginSection').classList.add('hidden');
+            document.getElementById('mainSection').classList.remove('hidden');
+            document.getElementById('userInfo').innerHTML = `<p>Welcome, ${currentUser}!</p>`;
+        }
+
+        function calculateSingle() {
+            const date = document.getElementById('dateInput').value;
+            fetch(`/zodiac?date=${encodeURIComponent(date)}`, {
+                headers: {'Authorization': sessionId}
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    document.getElementById('singleResult').innerHTML = `<span class="error">${data.error}</span>`;
+                } else {
+                    document.getElementById('singleResult').innerHTML = 
+                        `<strong>Chinese:</strong> ${data.chinese_zodiac}<br><strong>Western:</strong> ${data.western_zodiac}`;
+                }
+            });
+        }
+
+        function calculateBulk() {
+            const dates = document.getElementById('bulkDates').value.split('\n').filter(d => d.trim());
+            fetch('/bulk', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': sessionId
+                },
+                body: JSON.stringify(dates)
+            })
+            .then(response => response.json())
+            .then(data => {
+                let html = '';
+                if (data.results) {
+                    data.results.forEach(result => {
+                        if (result.success) {
+                            html += `<div><strong>${result.date}:</strong> Chinese: ${result.chinese_zodiac}, Western: ${result.western_zodiac}</div>`;
+                        } else {
+                            html += `<div class="error"><strong>${result.date}:</strong> ${result.error}</div>`;
+                        }
+                    });
+                }
+                document.getElementById('bulkResult').innerHTML = html;
+            });
+        }
+
+        function calculateRange() {
+            const start = document.getElementById('startDate').value;
+            const end = document.getElementById('endDate').value;
+            fetch(`/range?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`, {
+                headers: {'Authorization': sessionId}
+            })
+            .then(response => response.json())
+            .then(data => {
+                let html = '';
+                if (data.results) {
+                    data.results.slice(0, 20).forEach(result => {
+                        if (result.success) {
+                            html += `<div><strong>${result.date}:</strong> Chinese: ${result.chinese_zodiac}, Western: ${result.western_zodiac}</div>`;
+                        }
+                    });
+                    if (data.results.length > 20) html += `<div>... and ${data.results.length - 20} more results</div>`;
+                }
+                document.getElementById('rangeResult').innerHTML = html;
+            });
+        }
+
+        function shareResult() {
+            const date = document.getElementById('shareDateInput').value;
+            fetch('/share', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': sessionId
+                },
+                body: JSON.stringify({date})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.share_id) {
+                    document.getElementById('shareResult').innerHTML = 
+                        `<strong>Share ID:</strong> ${data.share_id}<br>
+                         <strong>Share Link:</strong> <a href="/shared/${data.share_id}" target="_blank">/shared/${data.share_id}</a><br>
+                         <strong>Result:</strong> Chinese: ${data.result.chinese_zodiac}, Western: ${data.result.western_zodiac}`;
+                } else {
+                    document.getElementById('shareResult').innerHTML = `<span class="error">${data.error}</span>`;
+                }
+            });
+        }
+
+        function loadHistory() {
+            fetch('/history', {
+                headers: {'Authorization': sessionId}
+            })
+            .then(response => response.json())
+            .then(data => {
+                let html = '';
+                if (Array.isArray(data) && data.length > 0) {
+                    data.reverse().forEach(entry => {
+                        const date = new Date(entry.timestamp * 1000);
+                        html += `<div class="history-item">
+                            <strong>${entry.date}</strong> (${date.toLocaleString()})<br>
+                            Chinese: ${entry.chinese_zodiac}, Western: ${entry.western_zodiac}
+                        </div>`;
+                    });
+                } else {
+                    html = '<p>No search history found.</p>';
+                }
+                document.getElementById('historyResult').innerHTML = html;
+            });
+        }
+
+        function loadShared() {
+            const shareId = document.getElementById('sharedDateInput').value;
+            fetch(`/shared/${shareId}`, {
+                headers: {'Authorization': sessionId}
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('sharedResult').innerHTML = `<strong>Result:</strong> Date: ${data.date}, Chinese: ${data.chinese_zodiac}, Western: ${data.western_zodiac}`;
+            });
+        }
+    </script>
+</body>
+</html>
