@@ -5,7 +5,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
-#include "httplib.h"
 #include <jsoncpp/json/json.h>
 #include <thread>
 #include <chrono>
@@ -18,12 +17,17 @@ httplib::Result make_request(const std::string& method, const std::string& path,
                            const std::string& body = "", 
                            const std::map<std::string, std::string>& headers = {},
                            const httplib::Headers& get_headers = {}) {
-    httplib::Client cli("localhost", 8080);
+    httplib::SSLClient cli("localhost", 8080);
+    cli.enable_server_certificate_verification(false);
     
     if (method == "GET") {
         return cli.Get(path, get_headers);
     } else if (method == "POST") {
-        return cli.Post(path, body, "application/json");
+        httplib::Headers request_headers;
+        for (const auto& entry : headers) {
+            request_headers.insert(entry);
+        }
+        return cli.Post(path, request_headers, body, "application/json");
     }
     
     return httplib::Result();

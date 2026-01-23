@@ -1,6 +1,5 @@
 // zodiacs.cpp
 #include "zodiacs.h"
-#include "httplib.h"
 #include <stdexcept>
 #include <sstream>
 #include <vector>
@@ -13,6 +12,8 @@
 #include <ctime>
 #include <mutex> // Required for std::mutex and std::lock_guard
 #include <fstream>
+#include <cstdlib>
+#include <memory>
 #include <openssl/sha.h>
 #include <thread>
 
@@ -20,6 +21,7 @@
 struct User {
     std::string username;
     std::string password_hash;
+    std::string salt;
 };
 
 struct SearchHistory {
@@ -30,15 +32,21 @@ struct SearchHistory {
 };
 
 std::map<std::string, User> users;
-std::map<std::string, std::string> sessions; // session_id -> username
+struct SessionInfo {
+    std::string username;
+    std::time_t expires_at;
+};
+std::map<std::string, SessionInfo> sessions; // session_id -> info
 std::map<std::string, std::vector<SearchHistory>> user_history; // username -> history
 std::mutex auth_mutex;
+constexpr std::time_t kSessionTtlSeconds = 60 * 60;
 
 // Helper function to hash password
-std::string hash_password(const std::string& password) {
+std::string hash_password(const std::string& password, const std::string& salt) {
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256_CTX sha256;
     SHA256_Init(&sha256);
+    SHA256_Update(&sha256, salt.c_str(), salt.size());
     SHA256_Update(&sha256, password.c_str(), password.size());
     SHA256_Final(hash, &sha256);
     
@@ -49,13 +57,28 @@ std::string hash_password(const std::string& password) {
     return ss.str();
 }
 
+std::string generate_salt() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, 15);
+    static std::mutex gen_mutex;
+
+    std::stringstream ss;
+    std::lock_guard<std::mutex> lock(gen_mutex);
+    for (int i = 0; i < 32; ++i) {
+        ss << std::hex << dis(gen);
+    }
+    return ss.str();
+}
+
 void load_users() {
     std::ifstream file("users.json");
     if (!file.is_open()) {
         // Create default admin user if file doesn't exist
         User admin;
         admin.username = "admin";
-        admin.password_hash = hash_password("admin123");
+        admin.salt = generate_salt();
+        admin.password_hash = hash_password("admin123", admin.salt);
         users["admin"] = admin;
         
         // Save to file
@@ -63,6 +86,7 @@ void load_users() {
         Json::Value user_obj;
         user_obj["username"] = admin.username;
         user_obj["password_hash"] = admin.password_hash;
+        user_obj["salt"] = admin.salt;
         root["admin"] = user_obj;
         
         std::ofstream out_file("users.json");
@@ -79,6 +103,7 @@ void load_users() {
             User user;
             user.username = root[key]["username"].asString();
             user.password_hash = root[key]["password_hash"].asString();
+            user.salt = root[key].isMember("salt") ? root[key]["salt"].asString() : "";
             users[key] = user;
         }
     }
@@ -90,6 +115,7 @@ void save_users() {
         Json::Value user_obj;
         user_obj["username"] = pair.second.username;
         user_obj["password_hash"] = pair.second.password_hash;
+        user_obj["salt"] = pair.second.salt;
         root[pair.first] = user_obj;
     }
     
@@ -97,6 +123,52 @@ void save_users() {
     Json::StreamWriterBuilder builder;
     std::unique_ptr<Json::StreamWriter> writer(builder.newStreamWriter());
     writer->write(root, &file);
+}
+
+bool get_session_user(const std::string& session_id, std::string& username_out, bool* expired_out = nullptr) {
+    std::lock_guard<std::mutex> lock(auth_mutex);
+    auto session_it = sessions.find(session_id);
+    if (session_it == sessions.end()) {
+        return false;
+    }
+
+    const std::time_t now = std::time(nullptr);
+    if (now >= session_it->second.expires_at) {
+        if (expired_out) {
+            *expired_out = true;
+        }
+        sessions.erase(session_it);
+        return false;
+    }
+
+    if (expired_out) {
+        *expired_out = false;
+    }
+    username_out = session_it->second.username;
+    return true;
+}
+
+bool invalidate_session(const std::string& session_id, bool* expired_out = nullptr) {
+    std::lock_guard<std::mutex> lock(auth_mutex);
+    auto session_it = sessions.find(session_id);
+    if (session_it == sessions.end()) {
+        return false;
+    }
+
+    const std::time_t now = std::time(nullptr);
+    if (now >= session_it->second.expires_at) {
+        if (expired_out) {
+            *expired_out = true;
+        }
+        sessions.erase(session_it);
+        return false;
+    }
+
+    if (expired_out) {
+        *expired_out = false;
+    }
+    sessions.erase(session_it);
+    return true;
 }
 
 // Generate session ID
@@ -339,12 +411,57 @@ std::vector<std::string> generate_date_range(const std::string& start_date, cons
     return dates;
 }
 
-httplib::Server &get_server() {
-    static httplib::Server svr;
+bool file_exists(const std::string& path) {
+    std::ifstream file(path);
+    return file.good();
+}
+
+std::string get_source_dir() {
+    std::string path = __FILE__;
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    return path.substr(0, pos);
+}
+
+struct CertPaths {
+    std::string cert_path;
+    std::string key_path;
+};
+
+CertPaths ensure_certificates() {
+    std::string base_dir = get_source_dir();
+    std::string cert_path = base_dir + "/cert.pem";
+    std::string key_path = base_dir + "/key.pem";
+
+    if (!file_exists(cert_path) || !file_exists(key_path)) {
+        std::cerr << "Generating self-signed TLS certificate..." << std::endl;
+        std::string command =
+            "openssl req -x509 -newkey rsa:2048 -keyout \"" + key_path +
+            "\" -out \"" + cert_path + "\" -days 365 -nodes -subj \"/CN=localhost\"";
+        if (std::system(command.c_str()) != 0) {
+            throw std::runtime_error("Failed to generate TLS certificate.");
+        }
+    }
+
+    return {cert_path, key_path};
+}
+
+httplib::SSLServer &get_server() {
+    static std::unique_ptr<httplib::SSLServer> svr;
     static bool server_initialized = false;
 
     if (server_initialized) {
-        return svr;
+        return *svr;
+    }
+
+    if (!svr) {
+        CertPaths certs = ensure_certificates();
+        svr.reset(new httplib::SSLServer(certs.cert_path.c_str(), certs.key_path.c_str()));
+        if (!svr->is_valid()) {
+            throw std::runtime_error("Failed to initialize TLS server.");
+        }
     }
 
 
@@ -353,12 +470,12 @@ httplib::Server &get_server() {
 
 
     // FIX: Add a logger to help with debugging
-    svr.set_logger([](const httplib::Request& req, const httplib::Response& res) {
+    svr->set_logger([](const httplib::Request& req, const httplib::Response& res) {
         std::cout << "[ " << req.method << " ] " << req.path << " -> " << res.status << std::endl;
     });
 
 
-    svr.Post("/login", [](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/login", [](const httplib::Request& req, httplib::Response& res) {
         Json::Value request_body;
         Json::Reader reader;
         
@@ -371,18 +488,34 @@ httplib::Server &get_server() {
         
         std::string username = request_body["username"].asString();
         std::string password = request_body["password"].asString();
-        std::string password_hash = hash_password(password);
         
         std::lock_guard<std::mutex> lock(auth_mutex);
         auto user_it = users.find(username);
-        if (user_it != users.end() && user_it->second.password_hash == password_hash) {
+        if (user_it != users.end()) {
+            std::string password_hash = hash_password(password, user_it->second.salt);
+            if (user_it->second.password_hash != password_hash) {
+                res.status = 401;
+                res.set_content("{\"error\": \"Invalid credentials\"}", "application/json");
+                return;
+            }
+
+            if (user_it->second.salt.empty()) {
+                user_it->second.salt = generate_salt();
+                user_it->second.password_hash = hash_password(password, user_it->second.salt);
+                save_users();
+            }
+
             std::string session_id = generate_session_id();
-            sessions[session_id] = username;
+            SessionInfo session;
+            session.username = username;
+            session.expires_at = std::time(nullptr) + kSessionTtlSeconds;
+            sessions[session_id] = session;
             
             Json::Value response;
             response["success"] = true;
             response["session_id"] = session_id;
             response["username"] = username;
+            response["expires_at"] = static_cast<Json::Int64>(session.expires_at);
             
             Json::StreamWriterBuilder builder;
             std::string json_response = Json::writeString(builder, response);
@@ -394,7 +527,7 @@ httplib::Server &get_server() {
     });
 
     // Register endpoint
-    svr.Post("/register", [](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/register", [](const httplib::Request& req, httplib::Response& res) {
         Json::Value request_body;
         Json::Reader reader;
         
@@ -417,15 +550,39 @@ httplib::Server &get_server() {
         
         User new_user;
         new_user.username = username;
-        new_user.password_hash = hash_password(password);
+        new_user.salt = generate_salt();
+        new_user.password_hash = hash_password(password, new_user.salt);
         users[username] = new_user;
         save_users();
         
         res.set_content("{\"success\": true}", "application/json");
     });
 
+    // Logout endpoint
+    svr->Post("/logout", [](const httplib::Request& req, httplib::Response& res) {
+        std::string session_id = req.get_header_value("Authorization");
+        if (session_id.empty()) {
+            res.status = 401;
+            res.set_content("{\"error\": \"Authorization required\"}", "application/json");
+            return;
+        }
+
+        bool expired = false;
+        if (!invalidate_session(session_id, &expired)) {
+            res.status = 401;
+            if (expired) {
+                res.set_content("{\"error\": \"Session expired\"}", "application/json");
+            } else {
+                res.set_content("{\"error\": \"Invalid session\"}", "application/json");
+            }
+            return;
+        }
+
+        res.set_content("{\"success\": true}", "application/json");
+    });
+
     // History endpoint
-    svr.Get("/history", [](const httplib::Request& req, httplib::Response& res) {
+    svr->Get("/history", [](const httplib::Request& req, httplib::Response& res) {
         std::string session_id = req.get_header_value("Authorization");
         if (session_id.empty()) {
             res.status = 401;
@@ -433,17 +590,21 @@ httplib::Server &get_server() {
             return;
         }
         
-        std::lock_guard<std::mutex> lock(auth_mutex);
-        auto session_it = sessions.find(session_id);
-        if (session_it == sessions.end()) {
+        std::string username;
+        bool expired = false;
+        if (!get_session_user(session_id, username, &expired)) {
             res.status = 401;
-            res.set_content("{\"error\": \"Invalid session\"}", "application/json");
+            if (expired) {
+                res.set_content("{\"error\": \"Session expired\"}", "application/json");
+            } else {
+                res.set_content("{\"error\": \"Invalid session\"}", "application/json");
+            }
             return;
         }
-        
-        std::string username = session_it->second;
+
         Json::Value response(Json::arrayValue);
         
+        std::lock_guard<std::mutex> lock(auth_mutex);
         if (user_history.find(username) != user_history.end()) {
             for (const auto& entry : user_history[username]) {
                 Json::Value history_entry;
@@ -464,15 +625,15 @@ httplib::Server &get_server() {
     auto get_username_from_session = [](const httplib::Request& req) -> std::string {
         std::string session_id = req.get_header_value("Authorization");
         if (session_id.empty()) return "";
-
-        
-        std::lock_guard<std::mutex> lock(auth_mutex);
-        auto session_it = sessions.find(session_id);
-        return (session_it != sessions.end()) ? session_it->second : "";
+        std::string username;
+        if (!get_session_user(session_id, username)) {
+            return "";
+        }
+        return username;
     };
 
     // Modified Chinese zodiac endpoint to track history
-    svr.Get("/chinese", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
+    svr->Get("/chinese", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
         if (!req.has_param("date")) {
             res.status = 400;
             res.set_content("{\"error\": \"Date parameter is required\"}", "application/json");
@@ -496,7 +657,7 @@ httplib::Server &get_server() {
     });
 
     // Modified Western zodiac endpoint to track history
-    svr.Get("/western", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
+    svr->Get("/western", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
         if (!req.has_param("date")) {
             res.status = 400;
             res.set_content("{\"error\": \"Date parameter is required\"}", "application/json");
@@ -520,7 +681,7 @@ httplib::Server &get_server() {
     });
 
     // Combined zodiac endpoint for history tracking
-    svr.Get("/zodiac", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
+    svr->Get("/zodiac", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
         if (!req.has_param("date")) {
             res.status = 400;
             res.set_content("{\"error\": \"Date parameter is required\"}", "application/json");
@@ -551,7 +712,7 @@ httplib::Server &get_server() {
     });
 
     // Bulk operations endpoint
-    svr.Post("/bulk", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/bulk", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
         Json::Value response;
         Json::Value results(Json::arrayValue);
         
@@ -605,7 +766,7 @@ httplib::Server &get_server() {
     });
 
     // Date range endpoint
-    svr.Get("/range", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
+    svr->Get("/range", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
         if (!req.has_param("start") || !req.has_param("end")) {
             res.status = 400;
             res.set_content("{\"error\": \"Both start and end date parameters are required\"}", "application/json");
@@ -667,7 +828,7 @@ httplib::Server &get_server() {
     });
 
     // Share results endpoint
-    svr.Post("/share", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
+    svr->Post("/share", [&get_username_from_session](const httplib::Request& req, httplib::Response& res) {
         Json::Value request_body;
         Json::Reader reader;
         
@@ -728,7 +889,7 @@ httplib::Server &get_server() {
     });
 
     // Get shared results endpoint
-    svr.Get("/shared/([a-f0-9]+)", [](const httplib::Request& req, httplib::Response& res) {
+    svr->Get("/shared/([a-f0-9]+)", [](const httplib::Request& req, httplib::Response& res) {
         std::string share_id = req.matches[1];
         
         std::lock_guard<std::mutex> lock(shared_results_mutex);
@@ -745,7 +906,7 @@ httplib::Server &get_server() {
     });
 
     // API Documentation endpoint (Swagger-like)
-    svr.Get("/api-docs", [](const httplib::Request& req, httplib::Response& res) {
+    svr->Get("/api-docs", [](const httplib::Request& req, httplib::Response& res) {
         Json::Value swagger;
         swagger["openapi"] = "3.0.0";
         
@@ -757,7 +918,7 @@ httplib::Server &get_server() {
         
         Json::Value servers(Json::arrayValue);
         Json::Value server;
-        server["url"] = "http://localhost:8080";
+        server["url"] = "https://localhost:8080";
         server["description"] = "Development server";
         servers.append(server);
         swagger["servers"] = servers;
@@ -826,6 +987,13 @@ httplib::Server &get_server() {
         share_post["parameters"].append(date_param);
         share_path["post"] = share_post;
         paths["/share"] = share_path;
+
+        // Logout endpoint
+        Json::Value logout_path;
+        Json::Value logout_post;
+        logout_post["summary"] = "Logout and invalidate session";
+        logout_path["post"] = logout_post;
+        paths["/logout"] = logout_path;
         
         // Shared result endpoint
         Json::Value shared_path;
@@ -859,20 +1027,20 @@ httplib::Server &get_server() {
     });
 
     // Serve static files (our HTML/JS)
-    svr.set_mount_point("/", "./static");
+    svr->set_mount_point("/", "./static");
 
     server_initialized = true;
 
-    std::cout << "Server starting on port 8080..." << std::endl;
-    svr.listen("0.0.0.0", 8080);
+    std::cout << "HTTPS server starting on port 8080..." << std::endl;
+    svr->listen("0.0.0.0", 8080);
 
 
-    return svr;
+    return *svr;
 }
 
 
 // int main() {
-//     httplib::Server &svr = get_server();
+//     httplib::SSLServer &svr = get_server();
 //     std::cout << "Server starting on port 8080..." << std::endl;
 //     svr.listen("0.0.0.0", 8080);
 //     return 0;

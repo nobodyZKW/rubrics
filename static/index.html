@@ -96,9 +96,48 @@
     <script>
         let sessionId = localStorage.getItem('sessionId');
         let currentUser = localStorage.getItem('currentUser');
+        let sessionExpiresAt = localStorage.getItem('sessionExpiresAt');
+        let logoutTimer = null;
 
         if (sessionId && currentUser) {
-            showMainSection();
+            const expiresAt = sessionExpiresAt ? parseInt(sessionExpiresAt, 10) : 0;
+            if (expiresAt && Date.now() / 1000 >= expiresAt) {
+                clearSession();
+            } else {
+                showMainSection();
+                scheduleLogout();
+            }
+        }
+
+        function clearSession() {
+            sessionId = null;
+            currentUser = null;
+            sessionExpiresAt = null;
+            localStorage.removeItem('sessionId');
+            localStorage.removeItem('currentUser');
+            localStorage.removeItem('sessionExpiresAt');
+            if (logoutTimer) {
+                clearTimeout(logoutTimer);
+                logoutTimer = null;
+            }
+            document.getElementById('loginSection').classList.remove('hidden');
+            document.getElementById('mainSection').classList.add('hidden');
+        }
+
+        function scheduleLogout() {
+            if (!sessionExpiresAt) return;
+            const expiresAt = parseInt(sessionExpiresAt, 10);
+            const remainingMs = (expiresAt * 1000) - Date.now();
+            if (remainingMs <= 0) {
+                logout();
+                return;
+            }
+            if (logoutTimer) {
+                clearTimeout(logoutTimer);
+            }
+            logoutTimer = setTimeout(() => {
+                logout();
+            }, remainingMs);
         }
 
         function showTab(tabName) {
@@ -122,9 +161,14 @@
                 if (data.success) {
                     sessionId = data.session_id;
                     currentUser = data.username;
+                    sessionExpiresAt = data.expires_at ? String(data.expires_at) : null;
                     localStorage.setItem('sessionId', sessionId);
                     localStorage.setItem('currentUser', currentUser);
+                    if (sessionExpiresAt) {
+                        localStorage.setItem('sessionExpiresAt', sessionExpiresAt);
+                    }
                     showMainSection();
+                    scheduleLogout();
                 } else {
                     document.getElementById('authMessage').innerHTML = '<span class="error">' + (data.error || 'Login failed') + '</span>';
                 }
@@ -156,12 +200,19 @@
         }
 
         function logout() {
-            sessionId = null;
-            currentUser = null;
-            localStorage.removeItem('sessionId');
-            localStorage.removeItem('currentUser');
-            document.getElementById('loginSection').classList.remove('hidden');
-            document.getElementById('mainSection').classList.add('hidden');
+            if (!sessionId) {
+                clearSession();
+                return;
+            }
+
+            fetch('/logout', {
+                method: 'POST',
+                headers: {'Authorization': sessionId}
+            })
+            .catch(() => {})
+            .finally(() => {
+                clearSession();
+            });
         }
 
         function showMainSection() {

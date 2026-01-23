@@ -17,7 +17,7 @@ COPY static/index.html static/
 COPY test/catch.hpp test/
 
 # Install development dependencies
-RUN apt-get update && apt-get install -y libjsoncpp-dev libssl-dev
+RUN apt-get update && apt-get install -y libjsoncpp-dev libssl-dev openssl
 
 # Expose port 8080
 EXPOSE 8080
